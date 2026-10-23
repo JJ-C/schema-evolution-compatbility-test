@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+// V2 schema: the "new" writer's view of Person.
+// Adds the "email" field at a brand-new tag number (3) -- the one and
+// only correct way to evolve a proto schema without breaking old readers.
+package protoevolution.v2;
+
+option java_package = "com.waltest.protoevolution.v2";
+option java_outer_classname = "PersonProto";
+
+message Person {
+  string name = 1;
+  int32 age = 2;
+  string email = 3; // <-- new field, added in v2
+}

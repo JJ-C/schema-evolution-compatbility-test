@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+// V1 schema: the "old" reader's view of Person.
+// Does NOT know about the "email" field added later.
+package protoevolution.v1;
+
+option java_package = "com.waltest.protoevolution.v1";
+option java_outer_classname = "PersonProto";
+
+message Person {
+  string name = 1;
+  int32 age = 2;
+  // NOTE: field 3 (email) does not exist here on purpose.
+}
