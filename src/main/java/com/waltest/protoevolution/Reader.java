@@ -43,6 +43,7 @@ public final class Reader {
         }
 
         System.out.println("[Reader v1] Read (v1 view, no email field): " + person);
+        explainUnknownFields(person);
 
         // Update an EXISTING field only. The v1 schema has no idea
         // "email" exists, so it can't touch it -- it just carries
@@ -56,5 +57,24 @@ public final class Reader {
         }
 
         System.out.println("[Reader v1] Wrote back with age bumped: " + updated);
+    }
+
+    /**
+     * The "3: ..." you see printed inside person.toString() above is NOT
+     * a field named "3" -- it's protobuf's TextFormat printer admitting
+     * it has no name for that tag, because v1's schema never declared
+     * it. This spells that out explicitly so the log isn't cryptic.
+     */
+    private static void explainUnknownFields(Person person) {
+        var unknownTags = person.getUnknownFields().asMap().keySet();
+        if (unknownTags.isEmpty()) {
+            System.out.println("[Reader v1] No unknown fields present.");
+            return;
+        }
+        for (int tag : unknownTags) {
+            System.out.println("[Reader v1] NOTE: tag " + tag
+                    + " above is unknown to v1 (it's the 'email' field in v2)."
+                    + " v1 cannot name or read it, but will carry its raw bytes through unchanged.");
+        }
     }
 }
