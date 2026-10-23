@@ -24,6 +24,11 @@
       <artifactId>protobuf-java</artifactId>
       <version>${protobuf.version}</version>
     </dependency>
+    <dependency>
+      <groupId>com.amazon.ion</groupId>
+      <artifactId>ion-java</artifactId>
+      <version>1.12.1</version>
+    </dependency>
   </dependencies>
 
   <build>

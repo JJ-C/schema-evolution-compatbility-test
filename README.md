@@ -1,4 +1,4 @@
-# proto-test — Proto Schema Evolution Round-Trip Test
+# proto-test — Schema Evolution Round-Trip Tests (Protobuf + Ion)
 
 Tests the classic protobuf forward/backward-compatibility guarantee:
 
@@ -61,3 +61,53 @@ rubber-stamping PASS no matter what.
 - JDK 21+, Maven, and a local `protoc` binary on `PATH`.
 - `pom.xml` pins `protobuf-java` to match your local `protoc` version
   (currently 31.1 / 4.31.1) — keep these in sync if you upgrade either.
+
+---
+
+## Same scenario with Amazon Ion
+
+`src/main/java/.../ion/` repeats the exact same experiment, but with
+Amazon Ion instead of protobuf — and the result is genuinely
+different, which is the whole point of running it.
+
+Ion is **self-describing** (like JSON): there's no compiled schema
+class, no wire-format tag numbers, no generated Builder that
+automatically drags unknown fields along for you. Whether `email`
+survives a round-trip through the old reader depends entirely on
+*how that reader's code is written* — there is no free safety net.
+
+Run both modes:
+
+```bash
+./run_ion_test.sh            # correct approach -> PASS
+./run_ion_test.sh --typed    # common real-world bug -> FAIL
+```
+
+| Approach | What it does | Result |
+|---|---|---|
+| `ion/Reader` default (generic struct) | Loads the whole document as a generic `IonStruct`, mutates only the `age` field in place, writes the *entire* struct back out. Never reconstructs the document from a narrow shape. | `email` **survives** |
+| `ion/Reader --typed` | Deserializes into a narrow `PersonV1(name, age)` record (the Ion equivalent of `objectMapper.readValue(json, V1.class)`), then rebuilds the output document FROM that record. | `email` is **silently dropped** |
+
+### The lesson this test teaches
+
+Protobuf and Ion both *can* carry forward-compatible data through an
+old reader — but they put the compatibility burden in different
+places:
+
+- **Protobuf**: compatibility is enforced by the **wire format
+  itself**. Generated code preserves unknown fields no matter how you
+  use it, as long as you don't go out of your way to discard them
+  (see `--discard` above).
+- **Ion / JSON-like formats**: compatibility is a **property of your
+  code**, not the format. If you deserialize into a narrow typed
+  shape and reserialize from that shape, you've effectively defined
+  your own mini schema that silently drops anything outside it — even
+  though the underlying format had no problem carrying it. The fix is
+  architectural: do partial, path-scoped updates on the generic
+  document instead of full deserialize/reserialize round-trips through
+  a narrow type.
+
+If a service in your real system binds Ion/JSON payloads straight
+into DTOs and writes those DTOs back out, it has this bug by default —
+whether or not anyone's tested for it. `--typed` mode above is that
+bug, caught in a bottle.
