@@ -1,4 +1,4 @@
-# proto-test — Schema Evolution Round-Trip Tests (Protobuf + Ion)
+# proto-test — Schema Evolution Round-Trip Tests (Protobuf, Ion, JSON, CBOR)
 
 Tests the classic protobuf forward/backward-compatibility guarantee:
 
@@ -111,3 +111,52 @@ If a service in your real system binds Ion/JSON payloads straight
 into DTOs and writes those DTOs back out, it has this bug by default —
 whether or not anyone's tested for it. `--typed` mode above is that
 bug, caught in a bottle.
+
+---
+
+## Same scenario with plain JSON and CBOR (Jackson)
+
+`src/main/java/.../jackson/` holds format-agnostic scenario logic
+shared by two thin variants:
+
+- `src/main/java/.../json/` — plain text JSON via a stock `ObjectMapper`
+- `src/main/java/.../cbor/` — binary CBOR via Jackson's `CBORMapper`
+
+They're the same three classes (`Writer`/`Reader`/`Verifier`) and the
+same logic either way, because Jackson's tree model (`JsonNode`/
+`ObjectNode`) doesn't care which format produced it — only the bytes
+on disk differ. That's actually the point of including both: it shows
+the compatibility story has nothing to do with "binary vs text" and
+everything to do with "generic tree vs typed DTO."
+
+```bash
+./run_json_test.sh            # correct approach -> PASS
+./run_json_test.sh --typed    # common real bug -> FAIL
+
+./run_cbor_test.sh            # correct approach -> PASS
+./run_cbor_test.sh --typed    # common real bug -> FAIL
+```
+
+| Approach | What it does | Result |
+|---|---|---|
+| `Reader` default (generic tree) | Loads the document as a generic `ObjectNode`, mutates only `age` in place, writes the whole node back out. | `email` **survives** |
+| `Reader --typed` | Binds into a narrow `PersonV1(name, age)` record via `treeToValue(...)`, then rebuilds the output document FROM that record. | `email` is **silently dropped** |
+
+One extra wrinkle worth knowing: Jackson's **default** setting
+(`FAIL_ON_UNKNOWN_PROPERTIES = true`) would actually **throw an
+exception** the moment you tried to bind JSON/CBOR containing `email`
+into a `PersonV1` record that doesn't declare it — fail loud, not
+fail silent. The `--typed` mode here deliberately disables that
+feature to simulate the extremely common real-world move of "just set
+ignore-unknown-properties so deserialization stops crashing," which is
+exactly the change that turns a loud, obvious bug into a silent,
+invisible one. Arguably worse than not catching it at all.
+
+## Full comparison across all four formats
+
+| Format | Preservation guaranteed by | Breaks by default? | How to break it on purpose |
+|---|---|---|---|
+| Protobuf | the wire format + generated code | No — safe by default | `--discard` (manually strip `UnknownFieldSet`) |
+| Amazon Ion | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (bind into a narrow record) |
+| JSON (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (same, plus Jackson will warn you by crashing unless you silence it) |
+| CBOR (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (identical to JSON — CBOR is just a binary encoding of the same tree model) |
