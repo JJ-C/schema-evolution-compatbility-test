@@ -3,8 +3,9 @@
 # scenario: Writer -> Reader (v1 shape, updates age) -> Verifier.
 #
 # Usage:
-#   ./run_json_test.sh           # correct approach: generic tree mutation -> PASS
-#   ./run_json_test.sh --typed   # common real bug: narrow DTO round-trip -> FAIL
+#   ./run_json_test.sh             # generic tree mutation -> PASS
+#   ./run_json_test.sh --typed     # narrow DTO round-trip, the common real bug -> FAIL
+#   ./run_json_test.sh --overflow  # narrow DTO + @JsonAnySetter/@JsonAnyGetter -> PASS
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -24,8 +25,8 @@ java -cp "$JAR" com.waltest.protoevolution.json.Writer "$DATA_FILE"
 echo
 echo "== 3. Reader (v1 shape) reads it, bumps age, writes back =="
 EXPECT_EMAIL="alice@example.com"
-if [[ "$MODE" == "--typed" ]]; then
-  java -cp "$JAR" com.waltest.protoevolution.json.Reader "$DATA_FILE" --typed
+if [[ -n "$MODE" ]]; then
+  java -cp "$JAR" com.waltest.protoevolution.json.Reader "$DATA_FILE" "$MODE"
 else
   java -cp "$JAR" com.waltest.protoevolution.json.Reader "$DATA_FILE"
 fi

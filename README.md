@@ -130,17 +130,20 @@ the compatibility story has nothing to do with "binary vs text" and
 everything to do with "generic tree vs typed DTO."
 
 ```bash
-./run_json_test.sh            # correct approach -> PASS
-./run_json_test.sh --typed    # common real bug -> FAIL
+./run_json_test.sh              # generic tree -> PASS
+./run_json_test.sh --typed      # narrow DTO round-trip, the common real bug -> FAIL
+./run_json_test.sh --overflow   # narrow DTO + @JsonAnySetter/@JsonAnyGetter -> PASS
 
-./run_cbor_test.sh            # correct approach -> PASS
-./run_cbor_test.sh --typed    # common real bug -> FAIL
+./run_cbor_test.sh              # generic tree -> PASS
+./run_cbor_test.sh --typed      # narrow DTO round-trip, the common real bug -> FAIL
+./run_cbor_test.sh --overflow   # narrow DTO + @JsonAnySetter/@JsonAnyGetter -> PASS
 ```
 
 | Approach | What it does | Result |
 |---|---|---|
 | `Reader` default (generic tree) | Loads the document as a generic `ObjectNode`, mutates only `age` in place, writes the whole node back out. | `email` **survives** |
 | `Reader --typed` | Binds into a narrow `PersonV1(name, age)` record via `treeToValue(...)`, then rebuilds the output document FROM that record. | `email` is **silently dropped** |
+| `Reader --overflow` | Binds into `PersonV1Safe`, a typed DTO with explicit `name`/`age` plus `@JsonAnySetter`/`@JsonAnyGetter` catching anything else into an overflow map. | `email` **survives**, and you get real typed access to the known fields too |
 
 One extra wrinkle worth knowing: Jackson's **default** setting
 (`FAIL_ON_UNKNOWN_PROPERTIES = true`) would actually **throw an
@@ -152,11 +155,19 @@ ignore-unknown-properties so deserialization stops crashing," which is
 exactly the change that turns a loud, obvious bug into a silent,
 invisible one. Arguably worse than not catching it at all.
 
+Notice `--overflow` never needed to touch `FAIL_ON_UNKNOWN_PROPERTIES`
+at all — `@JsonAnySetter` *is* the catch-all handler, so there's no
+"unrecognized property" to fail on in the first place. It gives you
+both type safety for the fields you know about AND forward-compat for
+the ones you don't. The catch: almost nobody writes this by default.
+It's a deliberate opt-in most teams only add after `--typed`'s bug
+has already bitten them once in production.
+
 ## Full comparison across all four formats
 
-| Format | Preservation guaranteed by | Breaks by default? | How to break it on purpose |
-|---|---|---|---|
-| Protobuf | the wire format + generated code | No — safe by default | `--discard` (manually strip `UnknownFieldSet`) |
-| Amazon Ion | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (bind into a narrow record) |
-| JSON (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (same, plus Jackson will warn you by crashing unless you silence it) |
-| CBOR (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (identical to JSON — CBOR is just a binary encoding of the same tree model) |
+| Format | Preservation guaranteed by | Breaks by default? | How to break it on purpose | Typed + safe option? |
+|---|---|---|---|---|
+| Protobuf | the wire format + generated code | No — safe by default | `--discard` (manually strip `UnknownFieldSet`) | Yes, always (it's the default) |
+| Amazon Ion | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (bind into a narrow record) | Not demoed here, but the same generic-struct pattern applies |
+| JSON (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (same, plus Jackson will warn you by crashing unless you silence it) | Yes — `--overflow` (`@JsonAnySetter`/`@JsonAnyGetter`) |
+| CBOR (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (identical to JSON — CBOR is just a binary encoding of the same tree model) | Yes — `--overflow`, identical mechanism to JSON |

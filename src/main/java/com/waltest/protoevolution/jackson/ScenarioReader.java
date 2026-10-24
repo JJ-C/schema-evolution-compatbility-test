@@ -12,29 +12,37 @@ import java.util.function.Supplier;
  * Format-agnostic reader logic, shared by the JSON and CBOR variants.
  *
  * Same story as the Ion test: there's no wire-format-level unknown
- * field preservation here. It's purely a function of whether the code
- * does a generic, path-scoped update (safe) or a full typed
- * deserialize/reserialize round-trip (lossy).
+ * field preservation here. Whether "email" survives is purely a
+ * function of which of three approaches the old reader's code takes.
  */
 public final class ScenarioReader {
 
     private ScenarioReader() {
     }
 
-    /** The "v1 schema" as a narrow, compiled-in Java shape. */
+    /** The naive "v1 schema" as a narrow, closed Java shape. No room for anything else. */
     public record PersonV1(String name, int age) {
     }
 
+    public enum Mode {
+        /** Generic tree, path-scoped update. Safe by construction. */
+        GENERIC,
+        /** Narrow record round-trip. The common real-world bug. */
+        TYPED_LOSSY,
+        /** Narrow DTO + @JsonAnySetter/@JsonAnyGetter overflow bucket. Safe, but nobody does it by default. */
+        TYPED_OVERFLOW
+    }
+
     public static void read(ObjectMapper mapper, Supplier<ObjectMapper> lenientMapperSupplier,
-                             Path dataFile, boolean typedMode, String label) throws IOException {
+                             Path dataFile, Mode mode, String label) throws IOException {
         JsonNode root = mapper.readTree(dataFile.toFile());
         System.out.println("[" + label + " Reader v1] Read: " + root);
         explainUnknownFields(root, label);
 
-        if (typedMode) {
-            runTypedLossyPath(mapper, lenientMapperSupplier, dataFile, root, label);
-        } else {
-            runGenericSafePath(mapper, dataFile, root, label);
+        switch (mode) {
+            case TYPED_LOSSY -> runTypedLossyPath(mapper, lenientMapperSupplier, dataFile, root, label);
+            case TYPED_OVERFLOW -> runTypedOverflowPath(mapper, dataFile, root, label);
+            case GENERIC -> runGenericSafePath(mapper, dataFile, root, label);
         }
     }
 
@@ -63,6 +71,27 @@ public final class ScenarioReader {
         mapper.writeValue(dataFile.toFile(), rebuilt);
 
         System.out.println("[" + label + " Reader v1] Wrote back (typed, lossy): " + rebuilt);
+    }
+
+    private static void runTypedOverflowPath(ObjectMapper mapper, Path dataFile, JsonNode root, String label)
+            throws IOException {
+        System.out.println("[" + label + " Reader v1] -- --overflow mode: binding into PersonV1Safe, which"
+                + " declares @JsonAnySetter/@JsonAnyGetter. No need to touch FAIL_ON_UNKNOWN_PROPERTIES at"
+                + " all -- the any-setter IS the catch-all handler for anything v1 doesn't explicitly model --");
+
+        // Note: uses the plain strict mapper, not a lenient one. The
+        // any-setter means there's no "unrecognized property" to fail
+        // on in the first place.
+        PersonV1Safe bound = mapper.treeToValue(root, PersonV1Safe.class);
+        bound.setAge(bound.getAge() + 1);
+        mapper.writeValue(dataFile.toFile(), bound);
+
+        // Printing via valueToTree (not writeValueAsString) keeps this
+        // log line sane for CBOR too, where writeValueAsString would
+        // try to decode binary bytes as UTF-8 text.
+        JsonNode printable = mapper.valueToTree(bound);
+        System.out.println("[" + label + " Reader v1] Wrote back (typed + overflow, preserves unknowns): "
+                + printable);
     }
 
     private static void runGenericSafePath(ObjectMapper mapper, Path dataFile, JsonNode root, String label)
