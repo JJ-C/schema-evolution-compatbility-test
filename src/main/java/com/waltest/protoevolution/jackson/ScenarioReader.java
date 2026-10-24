@@ -1,12 +1,12 @@
 package com.waltest.protoevolution.jackson;
 
-import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.function.Supplier;
 
 /**
  * Format-agnostic reader logic, shared by the JSON and CBOR variants.
@@ -25,26 +25,33 @@ public final class ScenarioReader {
     public record PersonV1(String name, int age) {
     }
 
-    public static void read(ObjectMapper mapper, Path dataFile, boolean typedMode, String label) throws IOException {
+    public static void read(ObjectMapper mapper, Supplier<ObjectMapper> lenientMapperSupplier,
+                             Path dataFile, boolean typedMode, String label) throws IOException {
         JsonNode root = mapper.readTree(dataFile.toFile());
         System.out.println("[" + label + " Reader v1] Read: " + root);
         explainUnknownFields(root, label);
 
         if (typedMode) {
-            runTypedLossyPath(mapper, dataFile, root, label);
+            runTypedLossyPath(mapper, lenientMapperSupplier, dataFile, root, label);
         } else {
             runGenericSafePath(mapper, dataFile, root, label);
         }
     }
 
-    private static void runTypedLossyPath(ObjectMapper mapper, Path dataFile, JsonNode root, String label)
-            throws IOException {
+    private static void runTypedLossyPath(ObjectMapper mapper, Supplier<ObjectMapper> lenientMapperSupplier,
+                                           Path dataFile, JsonNode root, String label) throws IOException {
         System.out.println("[" + label + " Reader v1] !! --typed mode: binding into a narrow name/age-only"
                 + " record. Jackson's DEFAULT setting would THROW on the unknown 'email' property; this"
                 + " demo disables FAIL_ON_UNKNOWN_PROPERTIES (a very common 'just be lenient' tweak teams"
                 + " add to stop crashes), which quietly drops the field instead of failing loud !!");
 
-        ObjectMapper lenient = mapper.copy().disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+        // The lenient (ignore-unknown-properties) mapper has to be built
+        // by the caller, which knows its own concrete mapper type
+        // (JsonMapper/CBORMapper) and therefore has access to the
+        // Jackson-3-friendly immutable .builder()...build() API. This
+        // shared method only ever consumes mappers, never reconfigures
+        // one via the deprecated mutable .disable(...) in place.
+        ObjectMapper lenient = lenientMapperSupplier.get();
         PersonV1 bound = lenient.treeToValue(root, PersonV1.class);
         PersonV1 updated = new PersonV1(bound.name(), bound.age() + 1);
 
