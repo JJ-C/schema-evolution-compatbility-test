@@ -1,173 +1,194 @@
-# proto-test — Schema Evolution Round-Trip Tests (Protobuf, Ion, JSON, CBOR)
+# Schema Evolution Compatibility Tests
 
-Tests the classic protobuf forward/backward-compatibility guarantee:
+Automated tests validating forward/backward-compatible schema
+evolution across four serialization formats: Protocol Buffers,
+Amazon Ion, JSON, and CBOR.
 
-> A writer on a **newer** schema adds a field. A reader still on the
-> **older** schema reads the message, updates an *existing* field, and
-> writes it back out. When the writer reads that file again, the field
-> it added should still be there, untouched — even though the old
-> reader never knew it existed.
+## 1. Objective
 
-This works because protobuf's binary wire format stores fields by tag
-number, not by name/position. A parser that doesn't recognize a tag
-keeps its raw bytes as an "unknown field" and re-emits them verbatim
-on the next serialize — *as long as nobody explicitly discards them*.
+Validate the following compatibility contract:
 
-## Layout
+1. A **writer** serializes a message using a schema version that
+   includes a field (`email`) which did not exist in an earlier
+   schema version.
+2. A **reader**, still built against the earlier schema version
+   (unaware of `email`), deserializes that message, modifies an
+   **existing** field (`age`), and re-serializes the message to the
+   same location.
+3. The writer re-reads the file. The field it added (`email`) must
+   still be present and unchanged, and the field the reader modified
+   (`age`) must reflect the update.
 
-```
-proto/v1/person.proto   # old schema: name, age
-proto/v2/person.proto   # new schema: name, age, email (new field, new tag)
-generate-proto.sh       # runs local protoc -> src/main/java
-src/main/java/.../
-  Writer.java    # v2: writes name/age/email
-  Reader.java    # v1: reads it (email is invisible), bumps age, writes back
-  Verifier.java  # v2: re-reads, asserts age updated AND email preserved
-run_test.sh      # orchestrates the whole scenario end-to-end
-```
+This models a real deployment scenario: two services built from
+different versions of the same schema, exchanging data through a
+shared file or message bus, deployed independently of one another.
 
-Why two separate generated packages (`v1` and `v2`) instead of one
-proto file? Because in real life the "old reader" and "new writer"
-are two different deployed services built from two different versions
-of the `.proto` file at two different points in time. Compiling both
-versions side-by-side (into different Java packages) is the most
-honest way to simulate that without needing two separate services.
+Each format is tested in multiple **modes** — distinct
+implementation strategies the reader could use. Only some modes
+satisfy the contract in step 3; others fail it. Both outcomes are
+intentional and are asserted by the test harness (`Verifier`), not
+inferred from logs.
 
-## Running it
+## 2. Results Summary
 
-```bash
-./run_test.sh              # happy path: email survives, age updates -> PASS
-./run_test.sh --discard    # negative control: reader drops unknown fields -> FAIL
-```
+10 total test runs across 4 formats. `./run_all.sh` executes all of
+them and reports a PASS/FAIL summary table, with a non-zero exit
+code if any scenario's actual result does not match its expected
+result.
 
-`--discard` isn't part of the real scenario — it exists only to prove
-the test harness actually catches a broken implementation instead of
-rubber-stamping PASS no matter what.
-
-## The schema evolution rule this encodes
-
--  Adding a new field with a **new, never-before-used tag number** is
-  safe. Old readers ignore it; the bytes just ride along.
--  Reusing a tag number, changing a tag's wire type, or changing a
-  required/singular field's type is **not** safe — that's actual
-  schema-breaking change, not evolution.
--  This guarantee is specific to **binary wire format**
-  (`writeTo`/`parseFrom`). If you serialize to **JSON**
-  (`JsonFormat.printer()`), unknown fields are dropped by default —
-  JSON round-trips do not get this safety net for free.
-
-## Requirements
-
-- JDK 21+, Maven, and a local `protoc` binary on `PATH`.
-- `pom.xml` pins `protobuf-java` to match your local `protoc` version
-  (currently 31.1 / 4.31.1) — keep these in sync if you upgrade either.
-
----
-
-## Same scenario with Amazon Ion
-
-`src/main/java/.../ion/` repeats the exact same experiment, but with
-Amazon Ion instead of protobuf — and the result is genuinely
-different, which is the whole point of running it.
-
-Ion is **self-describing** (like JSON): there's no compiled schema
-class, no wire-format tag numbers, no generated Builder that
-automatically drags unknown fields along for you. Whether `email`
-survives a round-trip through the old reader depends entirely on
-*how that reader's code is written* — there is no free safety net.
-
-Run both modes:
-
-```bash
-./run_ion_test.sh            # correct approach -> PASS
-./run_ion_test.sh --typed    # common real-world bug -> FAIL
-```
-
-| Approach | What it does | Result |
-|---|---|---|
-| `ion/Reader` default (generic struct) | Loads the whole document as a generic `IonStruct`, mutates only the `age` field in place, writes the *entire* struct back out. Never reconstructs the document from a narrow shape. | `email` **survives** |
-| `ion/Reader --typed` | Deserializes into a narrow `PersonV1(name, age)` record (the Ion equivalent of `objectMapper.readValue(json, V1.class)`), then rebuilds the output document FROM that record. | `email` is **silently dropped** |
-
-### The lesson this test teaches
-
-Protobuf and Ion both *can* carry forward-compatible data through an
-old reader — but they put the compatibility burden in different
-places:
-
-- **Protobuf**: compatibility is enforced by the **wire format
-  itself**. Generated code preserves unknown fields no matter how you
-  use it, as long as you don't go out of your way to discard them
-  (see `--discard` above).
-- **Ion / JSON-like formats**: compatibility is a **property of your
-  code**, not the format. If you deserialize into a narrow typed
-  shape and reserialize from that shape, you've effectively defined
-  your own mini schema that silently drops anything outside it — even
-  though the underlying format had no problem carrying it. The fix is
-  architectural: do partial, path-scoped updates on the generic
-  document instead of full deserialize/reserialize round-trips through
-  a narrow type.
-
-If a service in your real system binds Ion/JSON payloads straight
-into DTOs and writes those DTOs back out, it has this bug by default —
-whether or not anyone's tested for it. `--typed` mode above is that
-bug, caught in a bottle.
-
----
-
-## Same scenario with plain JSON and CBOR (Jackson)
-
-`src/main/java/.../jackson/` holds format-agnostic scenario logic
-shared by two thin variants:
-
-- `src/main/java/.../json/` — plain text JSON via a stock `ObjectMapper`
-- `src/main/java/.../cbor/` — binary CBOR via Jackson's `CBORMapper`
-
-They're the same three classes (`Writer`/`Reader`/`Verifier`) and the
-same logic either way, because Jackson's tree model (`JsonNode`/
-`ObjectNode`) doesn't care which format produced it — only the bytes
-on disk differ. That's actually the point of including both: it shows
-the compatibility story has nothing to do with "binary vs text" and
-everything to do with "generic tree vs typed DTO."
-
-```bash
-./run_json_test.sh              # generic tree -> PASS
-./run_json_test.sh --typed      # narrow DTO round-trip, the common real bug -> FAIL
-./run_json_test.sh --overflow   # narrow DTO + @JsonAnySetter/@JsonAnyGetter -> PASS
-
-./run_cbor_test.sh              # generic tree -> PASS
-./run_cbor_test.sh --typed      # narrow DTO round-trip, the common real bug -> FAIL
-./run_cbor_test.sh --overflow   # narrow DTO + @JsonAnySetter/@JsonAnyGetter -> PASS
-```
-
-| Approach | What it does | Result |
-|---|---|---|
-| `Reader` default (generic tree) | Loads the document as a generic `ObjectNode`, mutates only `age` in place, writes the whole node back out. | `email` **survives** |
-| `Reader --typed` | Binds into a narrow `PersonV1(name, age)` record via `treeToValue(...)`, then rebuilds the output document FROM that record. | `email` is **silently dropped** |
-| `Reader --overflow` | Binds into `PersonV1Safe`, a typed DTO with explicit `name`/`age` plus `@JsonAnySetter`/`@JsonAnyGetter` catching anything else into an overflow map. | `email` **survives**, and you get real typed access to the known fields too |
-
-One extra wrinkle worth knowing: Jackson's **default** setting
-(`FAIL_ON_UNKNOWN_PROPERTIES = true`) would actually **throw an
-exception** the moment you tried to bind JSON/CBOR containing `email`
-into a `PersonV1` record that doesn't declare it — fail loud, not
-fail silent. The `--typed` mode here deliberately disables that
-feature to simulate the extremely common real-world move of "just set
-ignore-unknown-properties so deserialization stops crashing," which is
-exactly the change that turns a loud, obvious bug into a silent,
-invisible one. Arguably worse than not catching it at all.
-
-Notice `--overflow` never needed to touch `FAIL_ON_UNKNOWN_PROPERTIES`
-at all — `@JsonAnySetter` *is* the catch-all handler, so there's no
-"unrecognized property" to fail on in the first place. It gives you
-both type safety for the fields you know about AND forward-compat for
-the ones you don't. The catch: almost nobody writes this by default.
-It's a deliberate opt-in most teams only add after `--typed`'s bug
-has already bitten them once in production.
-
-## Full comparison across all four formats
-
-| Format | Preservation guaranteed by | Breaks by default? | How to break it on purpose | Typed + safe option? |
+| Format | Reader Implementation Mode | Command | Result | Why |
 |---|---|---|---|---|
-| Protobuf | the wire format + generated code | No — safe by default | `--discard` (manually strip `UnknownFieldSet`) | Yes, always (it's the default) |
-| Amazon Ion | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (bind into a narrow record) | Not demoed here, but the same generic-struct pattern applies |
-| JSON (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (same, plus Jackson will warn you by crashing unless you silence it) | Yes — `--overflow` (`@JsonAnySetter`/`@JsonAnyGetter`) |
-| CBOR (Jackson) | nothing — 100% up to your code | No, but only if you stay generic | `--typed` (identical to JSON — CBOR is just a binary encoding of the same tree model) | Yes — `--overflow`, identical mechanism to JSON |
+| Protobuf | Default (generated Builder) | `./run_test.sh` | **PASS** | Wire format stores fields by tag number; the generated `Builder` carries unrecognized tags forward automatically. |
+| Protobuf | Explicit discard of unknown fields | `./run_test.sh --discard` | **FAIL** | Negative control. Proves the harness fails when unknown-field preservation is intentionally defeated. |
+| Amazon Ion | Generic struct, path-scoped update | `./run_ion_test.sh` | **PASS** | Document is held as a generic `IonStruct` tree; only the `age` key is mutated in place, so untouched keys are re-emitted unchanged. |
+| Amazon Ion | Bind to narrow typed record | `./run_ion_test.sh --typed` | **FAIL** | Document is deserialized into a Java record containing only `name`/`age`. The output is reconstructed from that record, which has no field to carry `email`. |
+| JSON (Jackson) | Generic tree, path-scoped update | `./run_json_test.sh` | **PASS** | Same mechanism as Ion generic mode, via Jackson's `ObjectNode`. |
+| JSON (Jackson) | Bind to narrow typed record | `./run_json_test.sh --typed` | **FAIL** | Same mechanism as Ion typed mode. Jackson's default setting (`FAIL_ON_UNKNOWN_PROPERTIES=true`) would reject this binding outright; the test disables that setting to reach the silent-loss outcome. |
+| JSON (Jackson) | Bind to typed DTO with catch-all property handler | `./run_json_test.sh --overflow` | **PASS** | DTO declares explicit fields for `name`/`age` and a `@JsonAnySetter`/`@JsonAnyGetter` pair that captures and re-emits any additional property, including ones added after the DTO was written. |
+| CBOR (Jackson) | Generic tree, path-scoped update | `./run_cbor_test.sh` | **PASS** | Identical mechanism to JSON generic mode. CBOR and JSON share Jackson's tree model; only the on-disk byte encoding differs. |
+| CBOR (Jackson) | Bind to narrow typed record | `./run_cbor_test.sh --typed` | **FAIL** | Identical mechanism to JSON typed mode. |
+| CBOR (Jackson) | Bind to typed DTO with catch-all property handler | `./run_cbor_test.sh --overflow` | **PASS** | Identical mechanism to JSON overflow mode. |
+
+### 2.1 Root cause, precisely stated
+
+A field survives the round-trip if and only if every step between
+reading and re-writing the document retains a place to store it.
+
+- **Protobuf** guarantees this at the library level: the generated
+  `Builder` always retains an `UnknownFieldSet` regardless of which
+  fields the application code reads or writes, unless that set is
+  explicitly cleared.
+- **Ion, JSON, and CBOR** provide no such guarantee at the library
+  level. Preservation is a direct consequence of which Java
+  representation the reader's code chooses:
+  - A generic tree representation (`IonStruct`, `ObjectNode`)
+    retains every key present in the source document, because it was
+    never narrowed to a fixed set of fields.
+  - A narrow typed class (a record or DTO exposing only the fields
+    that class declares) has no slot to hold a field it doesn't
+    define. Reconstructing output from that typed instance discards
+    anything outside its declared shape.
+  - A typed class with an explicit catch-all handler
+    (`@JsonAnySetter`/`@JsonAnyGetter` in Jackson) combines both
+    properties: declared fields are still strongly typed, and
+    undeclared fields are captured into a generic bucket and
+    re-emitted on write.
+
+## 3. Implementation Detail
+
+### 3.1 Protocol Buffers
+
+**Files:**
+```
+proto/v1/person.proto                 # old schema: name, age
+proto/v2/person.proto                 # new schema: name, age, email (new field, new tag)
+generate-proto.sh                     # runs local protoc -> src/main/java
+src/main/java/.../Writer.java         # v2: writes name, age, email
+src/main/java/.../Reader.java         # v1: reads the file, updates age, writes it back
+src/main/java/.../Verifier.java       # v2: re-reads the file, asserts age and email
+run_test.sh                           # orchestrates the full scenario
+```
+
+`v1` and `v2` are compiled into separate Java packages
+(`com.waltest.protoevolution.v1`, `...v2`) from two separate
+`.proto` files. This mirrors production reality: the "old reader"
+and "new writer" are two independently deployed services, each built
+from whichever schema version was current at their respective build
+time. Compiling both into one module keeps the test self-contained
+without requiring two separate deployable services.
+
+**Commands:**
+```bash
+./run_test.sh              # Reader preserves unknown fields by default -> PASS
+./run_test.sh --discard    # Reader explicitly clears UnknownFieldSet -> FAIL (negative control)
+```
+
+**Schema evolution rule this encodes:**
+- Adding a field with a new, previously unused tag number is a safe,
+  backward-compatible change.
+- Reusing a tag number, or changing the wire type of an existing
+  tag, is a breaking change — not covered by this guarantee.
+- This guarantee applies specifically to the **binary wire format**
+  (`writeTo`/`parseFrom`). Protobuf's JSON output
+  (`JsonFormat.printer()`) does not retain unknown fields by
+  default; it is not exercised by this test.
+
+**Requirements:** JDK 21+, Maven, a local `protoc` binary on `PATH`.
+`pom.xml` pins `protobuf-java` to match the local `protoc` version
+(currently 31.1 / 4.31.1); keep these in sync if either is upgraded.
+
+### 3.2 Amazon Ion
+
+**Files:**
+```
+src/main/java/.../ion/Writer.java     # writes name, age, email as an IonStruct
+src/main/java/.../ion/Reader.java     # two modes: generic struct update, or typed record binding
+src/main/java/.../ion/Verifier.java   # re-reads and asserts age and email
+run_ion_test.sh                       # orchestrates the scenario
+```
+
+Ion is a self-describing format: there is no compiled schema class
+and no wire-format-level unknown-field retention. `Reader.java`
+implements both representative strategies as explicit modes:
+
+| Mode | Reader behavior |
+|---|---|
+| default | Loads the document as a generic `IonStruct`. Mutates the `age` entry in place via `struct.put(...)`. Writes the entire struct back out. |
+| `--typed` | Reads `name` and `age` into a Java record `PersonV1(String name, int age)`. Constructs a brand-new `IonStruct` containing only those two fields and writes that. |
+
+**Commands:**
+```bash
+./run_ion_test.sh            # generic struct mode -> PASS
+./run_ion_test.sh --typed    # typed record mode -> FAIL
+```
+
+### 3.3 JSON and CBOR (Jackson)
+
+**Files:**
+```
+src/main/java/.../jackson/ScenarioWriter.java    # shared: writes name, age, email
+src/main/java/.../jackson/ScenarioReader.java    # shared: three modes (see below)
+src/main/java/.../jackson/ScenarioVerifier.java  # shared: asserts age and email
+src/main/java/.../jackson/PersonV1Safe.java      # typed DTO with catch-all property handler
+src/main/java/.../json/{Writer,Reader,Verifier}.java   # JSON entry points (plain ObjectMapper)
+src/main/java/.../cbor/{Writer,Reader,Verifier}.java   # CBOR entry points (CBORMapper)
+run_json_test.sh
+run_cbor_test.sh
+```
+
+JSON and CBOR share one implementation (`jackson/Scenario*.java`).
+Jackson's tree model (`JsonNode`/`ObjectNode`) is identical
+regardless of which format produced it; `JsonMapper` and `CBORMapper`
+differ only in how they encode/decode bytes on disk. The
+format-specific `json`/`cbor` packages are thin entry points that
+select the concrete `ObjectMapper` subtype and delegate to the
+shared logic.
+
+`ScenarioReader` implements three modes, selected via
+`ScenarioReader.Mode`:
+
+| Mode | CLI flag | Reader behavior |
+|---|---|---|
+| `GENERIC` | *(none)* | Loads the document as a generic `ObjectNode`. Mutates the `age` entry in place. Writes the whole node back out. |
+| `TYPED_LOSSY` | `--typed` | Binds the document into `PersonV1(String name, int age)` via `treeToValue(...)`. Constructs a new `ObjectNode` from only those two fields and writes that. Uses a mapper with `FAIL_ON_UNKNOWN_PROPERTIES` disabled — Jackson's default setting would otherwise reject this binding with an exception rather than silently dropping the field. |
+| `TYPED_OVERFLOW` | `--overflow` | Binds the document into `PersonV1Safe`, a class exposing typed `name`/`age` accessors plus a `@JsonAnySetter`-annotated method that captures any other property into an internal map, and a matching `@JsonAnyGetter` that re-emits that map's contents on serialize. No mapper reconfiguration is required; the any-setter itself prevents an "unrecognized property" condition from occurring. |
+
+**Commands:**
+```bash
+./run_json_test.sh              # GENERIC        -> PASS
+./run_json_test.sh --typed      # TYPED_LOSSY     -> FAIL
+./run_json_test.sh --overflow   # TYPED_OVERFLOW  -> PASS
+
+./run_cbor_test.sh              # GENERIC        -> PASS
+./run_cbor_test.sh --typed      # TYPED_LOSSY     -> FAIL
+./run_cbor_test.sh --overflow   # TYPED_OVERFLOW  -> PASS
+```
+
+## 4. Requirements
+
+- JDK 21+
+- Apache Maven
+- Local `protoc` binary on `PATH` (Protobuf test only)
+- Network access to the configured Maven repository for dependency
+  resolution (`protobuf-java`, `ion-java`, `jackson-databind`,
+  `jackson-dataformat-cbor`)
