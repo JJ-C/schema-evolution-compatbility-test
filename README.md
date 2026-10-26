@@ -1,8 +1,8 @@
 # Schema Evolution Compatibility Tests
 
 Automated tests validating forward/backward-compatible schema
-evolution across four serialization formats: Protocol Buffers,
-Amazon Ion, JSON, and CBOR.
+evolution across six serialization formats: Protocol Buffers, Amazon
+Ion, JSON, CBOR, Apache Avro, and Apache Thrift.
 
 ## 1. Objective
 
@@ -31,7 +31,7 @@ inferred from logs.
 
 ## 2. Results Summary
 
-10 total test runs across 4 formats. `./run_all.sh` executes all of
+14 total test runs across 6 formats. `./run_all.sh` executes all of
 them and reports a PASS/FAIL summary table, with a non-zero exit
 code if any scenario's actual result does not match its expected
 result.
@@ -48,6 +48,10 @@ result.
 | CBOR (Jackson) | Generic tree, path-scoped update | `./run_cbor_test.sh` | **PASS** | Identical mechanism to JSON generic mode. CBOR and JSON share Jackson's tree model; only the on-disk byte encoding differs. |
 | CBOR (Jackson) | Bind to narrow typed record | `./run_cbor_test.sh --typed` | **FAIL** | Identical mechanism to JSON typed mode. |
 | CBOR (Jackson) | Bind to typed DTO with catch-all property handler | `./run_cbor_test.sh --overflow` | **PASS** | Identical mechanism to JSON overflow mode. |
+| Avro | Read via embedded writer schema (no resolution) | `./run_avro_test.sh` | **PASS** | Avro container files embed the full writer schema in the file header. Reading with that schema directly (not resolving to a narrower one) returns a `GenericRecord` with every original field. |
+| Avro | Resolve to narrow reader schema | `./run_avro_test.sh --typed` | **FAIL** | Avro's schema-resolution logic skips any writer field absent from the supplied reader schema **while parsing**. The field is never read into memory, not merely omitted on write. |
+| Thrift | Default (generated struct) | `./run_thrift_test.sh` | **FAIL** | Standard generated Thrift code has no unknown-field retention mechanism. An unrecognized field ID is read past and discarded (`TProtocolUtil.skip(...)`) with no option to retain it. This is the ordinary, unmodified behavior — no special flag is required to produce this result. |
+| Thrift | Hand-rolled generic struct | `./run_thrift_test.sh --manual-preserve` | **PASS** | A custom reader (`GenericThriftStruct`, not part of any Thrift library) parses every field by its wire-level ID into a map, independent of any compiled struct definition, and re-emits all of them on write. |
 
 ### 2.1 Root cause, precisely stated
 
@@ -73,6 +77,20 @@ reading and re-writing the document retains a place to store it.
     properties: declared fields are still strongly typed, and
     undeclared fields are captured into a generic bucket and
     re-emitted on write.
+- **Avro** requires a schema to decode at all — its binary encoding
+  carries no field names or tags. Whether an old reader retains a new
+  field depends on which schema it hands to the decoder: the file's
+  own embedded writer schema (no resolution, retains everything), or
+  its own narrower compiled schema (resolution, which skips and
+  discards unrecognized writer fields at parse time, before
+  application code runs at all).
+- **Thrift**'s wire format (`TBinaryProtocol`) is tag-based, the same
+  conceptual mechanism as protobuf's. Unlike protobuf, however, the
+  code the `thrift` compiler generates implements no retention step
+  for unrecognized tags — it only skips them. The wire format could
+  support preservation; the generated code simply does not implement
+  it. Achieving it requires code equivalent to `GenericThriftStruct`
+  in this repository, which is not provided by Thrift itself.
 
 ## 3. Implementation Detail
 
@@ -184,6 +202,72 @@ shared logic.
 ./run_cbor_test.sh --overflow   # TYPED_OVERFLOW  -> PASS
 ```
 
+### 3.4 Apache Avro
+
+**Files:**
+```
+src/main/resources/avro/v1/person.avsc        # old schema: name, age
+src/main/resources/avro/v2/person.avsc        # new schema: name, age, email
+src/main/java/.../avro/AvroSchemas.java       # loads the .avsc resources
+src/main/java/.../avro/Writer.java            # writes an Avro Object Container File
+src/main/java/.../avro/Reader.java            # two modes: embedded-schema read, or resolve to v1
+src/main/java/.../avro/Verifier.java          # re-reads and asserts age and email
+run_avro_test.sh
+```
+
+Avro's binary encoding carries no field names or tags; a schema is
+required to decode it at all. Avro Object Container Files address
+this by embedding the full writer schema in the file's own header.
+`Reader.java` implements two modes that differ only in which schema
+is handed to the decoder:
+
+| Mode | CLI flag | Reader behavior |
+|---|---|---|
+| default | *(none)* | Opens the file with `GenericDatumReader<>()` and no explicit reader schema. The embedded writer schema (v2) is used as-is, returning a `GenericRecord` with every original field. Mutates `age`, writes the full record back with that same schema. |
+| `--typed` | `--typed` | Opens the file with `GenericDatumReader<>()` whose expected schema is explicitly set to v1 via `setExpected(...)`. Avro's schema-resolution logic skips the `email` field while parsing, because it is absent from the reader schema. Writes the resolved record back using the v1 schema only. |
+
+**Commands:**
+```bash
+./run_avro_test.sh            # embedded schema, no resolution -> PASS
+./run_avro_test.sh --typed    # resolved to v1 schema -> FAIL
+```
+
+### 3.5 Apache Thrift
+
+**Files:**
+```
+src/main/java/.../thrift/PersonV1.java              # hand-written, matches thrift-codegen shape for v1 IDL
+src/main/java/.../thrift/PersonV2.java              # hand-written, matches thrift-codegen shape for v2 IDL
+src/main/java/.../thrift/GenericThriftStruct.java   # hand-rolled generic reader/writer (not a Thrift feature)
+src/main/java/.../thrift/Writer.java                # writes name, age, email via TBinaryProtocol
+src/main/java/.../thrift/Reader.java                # two modes: generated struct, or hand-rolled generic struct
+src/main/java/.../thrift/Verifier.java              # re-reads and asserts age and email
+run_thrift_test.sh
+```
+
+No `thrift` compiler is used; `PersonV1` and `PersonV2` are written
+by hand to match the exact `read()`/`write()` structure the `thrift`
+compiler produces for the equivalent IDL. This keeps the
+unknown-field-handling logic (the `default:` branch in `read()`)
+visible in source rather than hidden inside generated output.
+
+| Mode | CLI flag | Reader behavior |
+|---|---|---|
+| default | *(none)* | Reads the file into a `PersonV1` instance via ordinary generated-style `read()`. Field ID 3 (`email`) has no `case` in that method's `switch` statement, so `TProtocolUtil.skip(...)` consumes and discards its bytes during parsing. Mutates `age`, writes a `PersonV1` (two fields only) back out. |
+| `--manual-preserve` | `--manual-preserve` | Reads the file with `GenericThriftStruct.readFrom(...)`, which loops over every field by its wire-level ID into a map, independent of any compiled struct. Mutates the value at ID 2, re-emits every captured ID/value pair on write. |
+
+**Commands:**
+```bash
+./run_thrift_test.sh                      # generated struct, default behavior -> FAIL
+./run_thrift_test.sh --manual-preserve    # hand-rolled generic struct -> PASS
+```
+
+Note the default-behavior polarity is reversed relative to every
+other format in this suite: elsewhere, the safe outcome is the
+default and an explicit flag is required to break it. For Thrift, the
+lossy outcome is the default, and an explicit, non-standard
+implementation is required to avoid it.
+
 ## 4. Requirements
 
 - JDK 21+
@@ -191,4 +275,4 @@ shared logic.
 - Local `protoc` binary on `PATH` (Protobuf test only)
 - Network access to the configured Maven repository for dependency
   resolution (`protobuf-java`, `ion-java`, `jackson-databind`,
-  `jackson-dataformat-cbor`)
+  `jackson-dataformat-cbor`, `avro`, `libthrift`)

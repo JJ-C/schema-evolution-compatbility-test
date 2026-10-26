@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "Person",
+  "namespace": "com.waltest.protoevolution.avro",
+  "fields": [
+    {"name": "name", "type": "string"},
+    {"name": "age", "type": "int"},
+    {"name": "email", "type": "string"}
+  ]
+}

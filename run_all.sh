@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs all 10 schema-evolution test scenarios across all 4 formats and
+# Runs all 14 schema-evolution test scenarios across all 6 formats and
 # prints a single PASS/FAIL summary table. Exits non-zero if any
 # scenario's actual result does not match its expected result.
 set -uo pipefail
@@ -41,6 +41,10 @@ run_case "JSON / --overflow"             PASS ./run_json_test.sh --overflow
 run_case "CBOR / default"                PASS ./run_cbor_test.sh
 run_case "CBOR / --typed"                FAIL ./run_cbor_test.sh --typed
 run_case "CBOR / --overflow"             PASS ./run_cbor_test.sh --overflow
+run_case "Avro / default"                PASS ./run_avro_test.sh
+run_case "Avro / --typed"                FAIL ./run_avro_test.sh --typed
+run_case "Thrift / default"              FAIL ./run_thrift_test.sh
+run_case "Thrift / --manual-preserve"    PASS ./run_thrift_test.sh --manual-preserve
 
 echo "===================================================================="
 echo "SUMMARY"
@@ -55,4 +59,4 @@ if [[ "$TOTAL_FAILURES" -gt 0 ]]; then
   exit 1
 fi
 
-echo "All 10 scenarios matched their expected result."
+echo "All 14 scenarios matched their expected result."
